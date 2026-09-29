@@ -1,0 +1,18 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.next/
+build/
+dist/
+logs/
+*.log
+.DS_Store
+serviceAccountKey.json
+*.pem
+browser-profiles/
+
+# Config del tunel: la genera servicio/configurar-ngrok.ps1 y es propia de
+# cada maquina.
+servicio/tunel.json
+servicio/ultima-url.txt

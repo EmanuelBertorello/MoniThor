@@ -1,0 +1,59 @@
+# Blueprint de Render para la API de PoliticaMonitor.
+#
+# Por qué acá y no en Cloud Functions: las functions de Firebase exigen el plan
+# Blaze (facturación abierta). Render tiene una capa gratuita real para web
+# services, así que la API vive acá y el frontend sigue en Firebase Hosting.
+#
+# Límites del plan free, para tener presentes:
+#   - 750 horas de instancia por mes (alcanza para un servicio siempre activo).
+#   - El servicio se duerme tras 15 minutos sin tráfico y tarda ~1 minuto en
+#     despertar. La primera visita del día va a ser lenta; las siguientes no.
+#   - Sin disco persistente: todo el estado vive en Firestore, así que da igual.
+#
+# El scraping NO corre acá (se dormiría): lo dispara GitHub Actions cada hora,
+# ver .github/workflows/scrape.yml.
+
+services:
+  - type: web
+    name: politica-monitor-api
+    runtime: node
+    plan: free
+    region: oregon
+
+    # Monorepo con npm workspaces: la raíz de npm es politica-monitor/.
+    rootDir: politica-monitor
+    buildCommand: npm ci --workspace=backend --omit=dev --no-audit --no-fund
+    startCommand: node backend/src/api-server.js
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Orígenes permitidos por CORS. Los dos dominios que Firebase Hosting
+      # asigna al mismo sitio.
+      - key: FRONTEND_URL
+        value: https://muni-8ed74.web.app,https://muni-8ed74.firebaseapp.com
+
+      - key: APIFY_MONTHLY_BUDGET_USD
+        value: '18'
+      - key: APIFY_SCRAPING_ENABLED
+        value: 'true'
+      - key: TARGET_MENTIONS_PER_RUN
+        value: '20'
+
+      # Estos se cargan a mano en el panel de Render (Environment). Nunca en
+      # este archivo: va versionado en GitHub.
+      #   FIREBASE_SERVICE_ACCOUNT  -> el JSON completo del service account
+      #   APIFY_API_KEY             -> token de Apify (rotado)
+      #   JWT_SECRET                -> secreto para las cookies sociales
+      #   NVIDIA_API_KEY            -> opcional, análisis de sentimiento remoto
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: APIFY_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false

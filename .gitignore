@@ -1,0 +1,47 @@
+# Dependencias
+node_modules/
+.npm
+.yarn-integrity
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+firebase-debug.log*
+firebase-debug.*.log*
+
+# Cache / build
+.firebase/
+.dataconnect
+.next/
+dist/
+build/Release
+coverage
+.nyc_output
+.eslintcache
+lib-cov
+
+# Runtime
+pids
+*.pid
+*.seed
+*.pid.lock
+.node_repl_history
+
+# Backups de repos git (internos, no subir)
+.git_backup_troyacode/
+_git_disabled/
+
+# Secretos - NUNCA subir. Se pasan por canal aparte.
+.env
+.env.*
+!.env.example
+!.env.*.example
+serviceAccountKey.json
+*serviceAccount*.json

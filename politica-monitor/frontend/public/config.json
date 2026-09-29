@@ -1,0 +1,4 @@
+{
+    "_comentario":  "URL del backend. La escribe servicio/mantener-backend.ps1 en cada arranque del tunel rapido de Cloudflare. Con un dominio fijo de ngrok esto deja de cambiar.",
+    "apiUrl":  "https://patch-yale-evaluated-sharp.trycloudflare.com"
+}

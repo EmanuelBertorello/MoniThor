@@ -1,0 +1,76 @@
+name: Scraping programado
+
+# Reemplaza a Cloud Scheduler, que exige el plan Blaze de Firebase. GitHub
+# Actions corre gratis y este job habla directo con Firestore, sin pasar por la
+# API: no hace falta ningún servidor levantado.
+#
+# Cadencia: cada hora entre las 09:00 y las 20:00 de Argentina. El cron de
+# GitHub va en UTC y Argentina es UTC-3, asi que 09-20 ART = 12-23 UTC.
+#
+# La cuenta, con tiempos medidos: cada corrida tarda ~5,2 min (Apify ~150s con
+# las dos redes en paralelo, fuentes gratis ~60s, sentimiento con IA ~60s,
+# arranque del runner ~40s). El plan Free de GitHub da 2000 minutos/mes en repos
+# privados, asi que 12 corridas diarias (~360 al mes) dan ~1870 min y entran con
+# margen. Las 24 horas serian ~3700 min y no entra.
+#
+# Si en algun momento sobran minutos, las palancas son: sumar horas al cron,
+# subir SENTIMENT_MAX_REMOTE_PER_RUN (mas menciones analizadas con IA) o subir
+# APIFY_POSTS_PER_KEYWORD (mas posts por red, ojo que eso si cuesta plata).
+on:
+  schedule:
+    - cron: '0 12-23 * * *'
+  workflow_dispatch: {}   # botón para correrlo a mano cuando quieras
+
+concurrency:
+  # Si una corrida se demora, la siguiente espera en vez de solaparse: dos
+  # scrapeos simultáneos duplicarían el gasto de Apify.
+  group: scraping
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          # Es un monorepo con npm workspaces: el lockfile vive en la raíz
+          # de politica-monitor, no adentro de backend.
+          cache-dependency-path: politica-monitor/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: politica-monitor
+        # Solo el workspace del backend: evita bajarse Angular y todo el
+        # frontend, que este job no usa. Probado en limpio: 336 paquetes, ~7s.
+        run: npm ci --workspace=backend --omit=dev --no-audit --no-fund
+
+      - name: Correr scraping
+        working-directory: politica-monitor/backend
+        env:
+          # JSON completo del service account de Firebase. lib/firebase.js lo
+          # lee de esta variable, así que no hace falta subir ningún archivo.
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+          APIFY_MONTHLY_BUDGET_USD: '18'
+          # Kill switch sin tocar código: creá la variable de repositorio
+          # APIFY_SCRAPING_ENABLED en false (Settings > Secrets and variables >
+          # Actions > Variables) y las corridas dejan de gastar Apify.
+          APIFY_SCRAPING_ENABLED: ${{ vars.APIFY_SCRAPING_ENABLED || 'true' }}
+
+          TARGET_MENTIONS_PER_RUN: '20'
+          # Tope de tiempo interno, por debajo del timeout-minutes de arriba,
+          # para que el job corte solo y alcance a guardar lo que ya juntó.
+          SCRAPE_TIME_BUDGET_MS: '600000'
+          NODE_ENV: production
+        run: node src/scraper-worker.js --now
+
+      - name: Dónde ver el detalle
+        if: always()
+        run: echo "Cada corrida queda registrada en la colección scrapeRuns de Firestore (totalSaved, shortfall, duración, qué hizo Apify)."

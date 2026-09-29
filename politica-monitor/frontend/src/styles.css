@@ -1,0 +1,92 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  /* Red de seguridad: ningún elemento ancho (tabla, gráfico, URL larga) puede
+     hacer scrollear la página entera en horizontal. El scroll va adentro del
+     contenedor que corresponda, no en el body. */
+  html, body { overflow-x: hidden; max-width: 100%; }
+  body {
+    @apply bg-surface text-slate-100 font-sans antialiased;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99,102,241,0.05), transparent);
+  }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { @apply bg-surface; }
+  ::-webkit-scrollbar-thumb { @apply bg-surface-border rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-muted; }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-card border border-surface-border rounded-xl shadow-card;
+  }
+  .btn-primary {
+    @apply bg-primary hover:bg-primary-dark text-white font-medium px-4 py-2 rounded-lg transition-all duration-200 hover:shadow-glow-sm active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply bg-surface-hover hover:bg-surface-border text-slate-300 hover:text-white font-medium px-4 py-2 rounded-lg border border-surface-border transition-all duration-200 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-danger {
+    @apply bg-danger/10 hover:bg-danger/20 text-danger border border-danger/30 font-medium px-4 py-2 rounded-lg transition-all duration-200 active:scale-95;
+  }
+  .input {
+    @apply bg-surface-input border border-surface-border text-slate-100 placeholder-muted rounded-lg px-3 py-2 w-full focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/30 transition-all duration-200;
+  }
+  .select {
+    @apply bg-surface-input border border-surface-border text-slate-100 rounded-lg px-3 py-2 w-full focus:outline-none focus:border-primary transition-all duration-200 cursor-pointer;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+  .badge-positive { @apply badge bg-success/15 text-success; }
+  .badge-negative { @apply badge bg-danger/15 text-danger; }
+  .badge-neutral { @apply badge bg-muted/20 text-slate-400; }
+  .badge-info { @apply badge bg-info/15 text-info; }
+  .badge-warning { @apply badge bg-warning/15 text-warning; }
+  .stat-card {
+    @apply card p-5 hover:border-primary/30 transition-all duration-300;
+  }
+  .nav-link {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-muted hover:text-slate-100 hover:bg-surface-hover transition-all duration-200 cursor-pointer;
+  }
+  .nav-link.active {
+    @apply text-primary bg-primary/10 border border-primary/20;
+  }
+  .section-title {
+    @apply text-xs font-semibold text-muted uppercase tracking-widest mb-2 px-3;
+  }
+  .modal-overlay {
+    @apply fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in;
+  }
+  .modal-box {
+    @apply card w-full max-w-lg p-6 animate-slide-up;
+  }
+  .table-header {
+    @apply text-xs font-semibold text-muted uppercase tracking-wider text-left py-3 px-4 border-b border-surface-border;
+  }
+  .table-cell {
+    @apply py-3 px-4 text-sm border-b border-surface-border/50;
+  }
+  .skeleton {
+    @apply bg-surface-border rounded animate-pulse;
+    background: linear-gradient(90deg, #1a1a2e 25%, #1e1e38 50%, #1a1a2e 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+  .live-dot {
+    @apply w-2 h-2 rounded-full bg-success animate-ping-once;
+  }
+  /* Barra de tabs con scroll horizontal en mobile: se desplaza, pero sin
+     mostrar la barra de scroll encima del contenido. */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .trend-up { @apply text-success text-xs font-medium flex items-center gap-1; }
+  .trend-down { @apply text-danger text-xs font-medium flex items-center gap-1; }
+}

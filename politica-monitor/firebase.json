@@ -1,0 +1,53 @@
+{
+  "firestore": {
+    "indexes": "firestore.indexes.json",
+    "rules": "firestore.rules"
+  },
+  "functions": {
+    "source": "backend",
+    "runtime": "nodejs22",
+    "ignore": [
+      "node_modules",
+      "browser-profiles",
+      ".env",
+      ".env.local",
+      "*.log",
+      "serviceAccountKey.json",
+      "key_value_stores",
+      "logs",
+      "src/migrate-to-firebase-auth.js",
+      "src/reconnect-fb.js",
+      "src/cleandb.js",
+      "src/limpiar_db.js",
+      "src/limpiar_duplicados.js",
+      "src/reconnect-fb.js"
+    ]
+  },
+  "hosting": {
+    "public": "frontend/dist/frontend/browser",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false,
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ],
+    "headers": [
+      {
+        "source": "**/*.@(js|css)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      }
+    ]
+  }
+}
