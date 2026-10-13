@@ -7,7 +7,53 @@ function haystack(post) {
   return [post.postText || '', post.author?.name || ''].filter(Boolean).join(' . ');
 }
 
-async function scrapeFacebook({ keywords, maxAgeMins, maxPerKeyword = 15, maxResults = 1, campaignId, excludeUrls, location, maxAttempts = 2, maxLimitCap = 40, skipComments = false }) {
+// Mención cruda SIN `extra`. Una sola definición: se usa tanto para calcular la
+// identidad (dedupeKey) al chequear existencia como para el resultado final,
+// así el ID que consulta el scraper es el mismo que después usa saveMentions.
+function baseMention(post, keyword, campaignId) {
+  const text = post.postText || '';
+  return {
+    campaignId, source: 'FACEBOOK',
+    sourceUrl: post.url,
+    sourceName: post.author?.name || 'Facebook',
+    author: post.author?.name || null,
+    content: text.slice(0, 2000),
+    snippet: text.slice(0, 300),
+    reach: post.reactionsCount || 0,
+    engagement: (post.reactionsCount || 0) + (post.commentsCount || 0) + (post.sharesCount || 0),
+    publishedAt: post.timestamp ? new Date(post.timestamp) : new Date(),
+    keyword,
+  };
+}
+
+// Filtro de fecha en ORIGEN. El actor scraper_one~facebook-posts-search lo
+// expresa con `startDate` (YYYY-MM-DD, día completo en UTC) y ordena con
+// `searchType` ('top' = más populares, 'latest' = más recientes). Para extraer
+// por delta conviene 'latest': el límite de resultados se agota con lo más
+// nuevo, no con lo más popular. (`onlyPostsNewerThan`, `since` y
+// `filter_by_recent_posts` son de OTROS actores de Facebook; si se cambia de
+// actor, este es el único lugar a tocar.)
+function dateFilterInput(since) {
+  if (!since) return {};
+  return { startDate: since.toISOString().slice(0, 10), searchType: 'latest' };
+}
+
+// `startDate` tiene granularidad de día: el actor puede devolver posts de ese
+// mismo día anteriores a `since`. Este chequeo exacto es la garantía real.
+function isBefore(ts, since) {
+  if (!since || !ts) return false;
+  const t = new Date(ts);
+  return !isNaN(t.getTime()) && t < since;
+}
+
+// `knownChecker` (lib/knownMentions.createKnownChecker) reemplaza a la descarga
+// de 7 días de URLs. `excludeUrls` se sigue aceptando por compatibilidad con
+// otros llamadores; se puede borrar cuando se confirme que nadie más lo pasa.
+//
+// since:          Date. Límite inferior (delta). Sin él, no se filtra por fecha en origen.
+// strictLocation: true => si el actor no reconoce la zona NO se reintenta sin
+//                 `location` (ese reintento trae resultados globales, "sin zona").
+async function scrapeFacebook({ keywords, maxAgeMins, maxPerKeyword = 15, maxResults = 1, campaignId, excludeUrls, knownChecker, location, since, strictLocation = false, maxAttempts = 2, maxLimitCap = 40, skipComments = false }) {
   const exclude = excludeUrls instanceof Set ? excludeUrls : new Set(excludeUrls || []);
   const results = [];
 
@@ -25,30 +71,54 @@ async function scrapeFacebook({ keywords, maxAgeMins, maxPerKeyword = 15, maxRes
           query: keyword,
           resultsCount: limit,
           ...(useLocation ? { location } : {}),
+          ...dateFilterInput(since),
         });
-        matches = items.filter(p => {
-          // El nombre de la página cuenta como parte del texto a matchear: los
-          // posts que publica el propio candidato casi nunca lo nombran en el
-          // cuerpo ("Seguimos sumando herramientas para transformar Río
-          // Grande!"), y mirando solo postText se descartaban justo esos.
-          // También rescata los posts de solo imagen, que vienen sin texto.
+
+        // Si el actor ignorara el filtro de fecha, casi todo vendría "viejo":
+        // se deja constancia para detectarlo (el resultado igual es correcto,
+        // porque abajo se vuelve a filtrar, pero el ahorro en Apify no existiría).
+        if (since && items.length >= 5) {
+          const stale = items.filter(p => isBefore(p.timestamp, since)).length;
+          if (stale / items.length > 0.5) {
+            logger.warn(`[FB-Apify] "${keyword}": ${stale}/${items.length} posts anteriores a ${since.toISOString()} — el actor no está aplicando startDate`);
+          }
+        }
+
+        // Fase 1 (síncrona, gratis): relevancia. El nombre de la página cuenta
+        // como parte del texto a matchear: los posts que publica el propio
+        // candidato casi nunca lo nombran en el cuerpo, y mirando solo
+        // postText se descartaban justo esos. También rescata los posts de solo
+        // imagen, que vienen sin texto.
+        const candidates = items.filter(p => {
           const texto = haystack(p);
           return containsKeyword(texto, keyword)
             && isWithinRange(p.timestamp, maxAgeMins)
+            && !isBefore(p.timestamp, since)
             && !isForeignScript(texto)
             && !isForeignCountry(texto)
             && !isPortuguese(texto)
             && !isSportsNoise(texto)
             && !isEnglishNoise(texto)
             && !exclude.has(p.url);
-        }).slice(0, maxResults);
+        });
+
+        // Fase 2 (Firestore, solo sobre los candidatos): descartar los que ya
+        // tenemos. Revisa por tandas y corta al juntar `maxResults` nuevos.
+        matches = knownChecker
+          ? await knownChecker.firstUnknown(candidates, maxResults, p => baseMention(p, keyword, campaignId))
+          : candidates.slice(0, maxResults);
         if (matches.length >= maxResults) break;
 
         // El actor no reconoce algunas ciudades (ambigüedad, ej. "Río Grande"
-        // vs Rio Grande de Brasil) y devuelve 0 posts en vez de fallar. Si
-        // pasó eso, reintentamos la keyword sola, sin el filtro geográfico,
-        // en vez de descartar el post entero.
+        // vs Rio Grande de Brasil) y devuelve 0 posts en vez de fallar. Por
+        // defecto reintentamos la keyword sola, sin el filtro geográfico, en
+        // vez de descartar el post entero. Con strictLocation NO: ese reintento
+        // devuelve resultados de cualquier zona.
         if (useLocation && items.length === 0) {
+          if (strictLocation) {
+            logger.info(`[FB-Apify] "${keyword}": el actor no reconoció la zona "${location}" — strictLocation, no se reintenta sin zona`);
+            break;
+          }
           useLocation = false;
           continue;
         }
@@ -86,16 +156,7 @@ async function scrapeFacebook({ keywords, maxAgeMins, maxPerKeyword = 15, maxRes
         }
 
         results.push({
-          campaignId, source: 'FACEBOOK',
-          sourceUrl: post.url,
-          sourceName: post.author?.name || 'Facebook',
-          author: post.author?.name || null,
-          content: text.slice(0, 2000),
-          snippet: text.slice(0, 300),
-          reach: post.reactionsCount || 0,
-          engagement: (post.reactionsCount || 0) + (post.commentsCount || 0) + (post.sharesCount || 0),
-          publishedAt: post.timestamp ? new Date(post.timestamp) : new Date(),
-          keyword,
+          ...baseMention(post, keyword, campaignId),
           extra: {
             reactions: post.reactions,
             sharesCount: post.sharesCount,

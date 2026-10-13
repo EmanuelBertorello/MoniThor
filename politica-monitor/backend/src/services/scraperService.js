@@ -5,8 +5,9 @@ const logger = require('../lib/logger');
 const { analyzeSentiment } = require('./sentimentService');
 const { getDb } = require('../lib/firebase');
 const { invalidarCampana } = require('../lib/cacheLecturas');
-const { generateId, toDocs } = require('../lib/db');
-const { filterAlreadySaved } = require('../lib/dedupe');
+const { toDocs } = require('../lib/db');
+const { dedupeBatch, dedupeKey } = require('../lib/dedupe');
+const { mentionDocId } = require('../lib/knownMentions');
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -224,7 +225,8 @@ async function scrapeNewsAPI(keyword, geo, campaignId, keywordId) {
       const content = (a.title || '') + '. ' + (a.description || '');
       if (!containsKeyword(content, keyword)) continue;
 
-      const { sentiment, score } = await analyzeSentiment(content);
+      // Sentimiento NO se calcula acá (una llamada de red por artículo, antes de
+      // deduplicar): lo hace enrichNewMentions sobre lo que realmente se guarda.
       results.push({
         campaignId, keywordId,
         source: 'NEWS',
@@ -233,7 +235,6 @@ async function scrapeNewsAPI(keyword, geo, campaignId, keywordId) {
         author: a.author || null,
         content: content.slice(0, 800),
         snippet: (a.description || '').slice(0, 300),
-        sentiment, sentimentScore: score,
         reach: 0,
         engagement: 0,
         publishedAt: a.publishedAt ? new Date(a.publishedAt) : new Date(),
@@ -381,51 +382,64 @@ async function enrichNewMentions(mentions, { enrichLimit = 10, concurrency = 5 }
   return mentions;
 }
 
+// Recolecta UNA keyword de las fuentes web (Google News + portales geo, NewsAPI)
+// SIN guardar. `includeSocial` mantiene el comportamiento histórico de
+// collectFreeSources (scrapeSocial en paralelo); el flujo secuencial lo apaga
+// porque FB/IG tienen su propio paso (Apify) y no deben dispararse dos veces.
+async function collectKeywordSources(campaignId, geo, kw, { includeSocial = true } = {}) {
+  try {
+    const [openSearch, newsApi, social] = await Promise.allSettled([
+      scrapeOpenSearch(kw.term, geo, campaignId, kw.id, kw.tags || []),
+      scrapeNewsAPI(kw.term, geo, campaignId, kw.id),
+      includeSocial ? scrapeSocial(kw.term, geo, campaignId, kw.id) : Promise.resolve([]),
+    ]);
+
+    const batch = [
+      ...(openSearch.status === 'fulfilled' ? openSearch.value : []),
+      ...(newsApi.status   === 'fulfilled' ? newsApi.value   : []),
+      ...(social.status    === 'fulfilled' ? social.value    : []),
+    ];
+
+    // Una fuente caída no puede tumbar la corrida ni las otras keywords.
+    [openSearch, newsApi, social].forEach(r => {
+      if (r.status === 'rejected') logger.warn(`Fuente falló en "${kw.term}": ${r.reason?.message || r.reason}`);
+    });
+
+    logger.info(`OK "${kw.term}": ${batch.length} menciones brutas`);
+    return batch;
+  } catch (err) {
+    logger.error(`ERROR "${kw.term}": ${err.message}`);
+    return [];
+  }
+}
+
+// Fuentes custom de la campaña (no dependen de la keyword). Devuelve el crudo.
+async function collectCampaignCustomSources(campaignId) {
+  try {
+    const { scrapeCustomSources } = require('./customScraper');
+    const customResult = await scrapeCustomSources(campaignId);
+    return customResult.mentions || [];
+  } catch (err) {
+    logger.warn(`Custom sources: ${err.message}`);
+    return [];
+  }
+}
+
 // Recolecta de todas las fuentes gratis (Google News, NewsAPI, portales geo,
 // fuentes custom) SIN guardar. Devuelve el crudo; guardar es responsabilidad
 // del que llama, que decide la ventana temporal y el objetivo de volumen.
+// (Flujo histórico: todas las keywords en paralelo. El flujo secuencial usa
+// collectKeywordSources / collectCampaignCustomSources directamente.)
 async function collectFreeSources(campaign, geo, opts = {}) {
   const campaignId = campaign.id;
   const allResults = [];
 
-  const jobs = campaign.keywords.map(async (kw) => {
-    try {
-      const [openSearch, newsApi, social] = await Promise.allSettled([
-        scrapeOpenSearch(kw.term, geo, campaignId, kw.id, kw.tags || []),
-        scrapeNewsAPI(kw.term, geo, campaignId, kw.id),
-        scrapeSocial(kw.term, geo, campaignId, kw.id),
-      ]);
-
-      const batch = [
-        ...(openSearch.status === 'fulfilled' ? openSearch.value : []),
-        ...(newsApi.status   === 'fulfilled' ? newsApi.value   : []),
-        ...(social.status    === 'fulfilled' ? social.value    : []),
-      ];
-
-      // Una fuente caída no puede tumbar la corrida ni las otras keywords.
-      [openSearch, newsApi, social].forEach(r => {
-        if (r.status === 'rejected') logger.warn(`Fuente falló en "${kw.term}": ${r.reason?.message || r.reason}`);
-      });
-
-      logger.info(`OK "${kw.term}": ${batch.length} menciones brutas`);
-      return batch;
-    } catch (err) {
-      logger.error(`ERROR "${kw.term}": ${err.message}`);
-      return [];
-    }
-  });
-
+  const jobs = campaign.keywords.map(kw => collectKeywordSources(campaignId, geo, kw));
   const results = await Promise.allSettled(jobs);
   results.forEach(r => { if (r.status === 'fulfilled') allResults.push(...r.value); });
 
   if (opts.includeCustomSources !== false) {
-    try {
-      const { scrapeCustomSources } = require('./customScraper');
-      const customResult = await scrapeCustomSources(campaignId);
-      if (customResult.mentions?.length > 0) allResults.push(...customResult.mentions);
-    } catch (err) {
-      logger.warn(`Custom sources: ${err.message}`);
-    }
+    allResults.push(...await collectCampaignCustomSources(campaignId));
   }
 
   return allResults;
@@ -454,34 +468,165 @@ async function loadCampaignContext(campaignId) {
   return { campaign, geo };
 }
 
-// Guarda un lote ya recolectado: deduplica en memoria, descarta lo que ya está
-// en Firestore, enriquece solo lo nuevo y escribe en batches de 500.
+// ─────────────────────────────────────────────────────────────────────────────
+// Delta por fecha (solo FB/IG vía Apify; NewsAPI/Google News NO lo usan)
+// ─────────────────────────────────────────────────────────────────────────────
+// Límite inferior cronológico para pedirle al actor solo lo posterior a lo que
+// ya tenemos. Dos piezas:
+//   getLastPublishedAt: 1 lectura (última mención de la campaña y fuente).
+//   computeSince:       lo convierte en el `since` efectivo.
+//
+// REQUIERE índice compuesto en firestore.indexes.json (mentions):
+//   campaignId ASC, source ASC, publishedAt DESC
+// Sin él, getLastPublishedAt avisa y devuelve el valor por defecto (no rompe).
+
+const DELTA_DEFAULT_DAYS = Number(process.env.DELTA_DEFAULT_DAYS || 7);
+// Margen hacia atrás: un post puede publicarse ANTES de la última mención
+// guardada y aparecer en la búsqueda recién después (indexación tardía). Sin
+// margen, ese post quedaría por debajo de la marca para siempre. Lo ya visto
+// dentro del margen lo descarta el dedup por hash.
+const DELTA_OVERLAP_MINS = Number(process.env.DELTA_OVERLAP_MINS || 360);
+
+// Fecha (`publishedAt`) de la última mención guardada para campaña + fuente.
+// Sin registros previos (o ante error): ahora - DELTA_DEFAULT_DAYS.
+async function getLastPublishedAt(db, campaignId, source) {
+  // Límite estático de 24 horas hacia atrás. 
+  // TODO: Emanuel reemplazará esto por la lectura en la memoria caché SSR
+  return new Date(Date.now() - 24 * 60 * 60 * 1000); 
+}
+
+// `since` efectivo = el más reciente entre:
+//   - la última publicación guardada menos el margen de solapamiento, y
+//   - el tope de ventana (no se le pide al actor más de lo que el scraper
+//     igualmente aceptaría; si no, se pagan resultados que se descartan).
+function computeSince(lastPublishedAt, { windowMins = 1440, overlapMins = DELTA_OVERLAP_MINS } = {}) {
+  const floor = Date.now() - windowMins * 60000;
+  const fromDelta = lastPublishedAt.getTime() - overlapMins * 60000;
+  return new Date(Math.max(floor, fromDelta));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistencia con ID determinista (SHA-256), igual que orchestrator.js.
+//
+// ID del documento = mentionDocId(campaignId, dedupeKey): la propia colección
+// `mentions` es el filtro de duplicados (sin límite de ventana, sin índice extra).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// LEGADO: noticias guardadas antes de este cambio tienen ID aleatorio
+// (generateId) y getAll no las ve. Se las busca por dedupeKey/sourceUrl SOLO
+// para los candidatos que getAll no encontró. dailyCleanup borra todo a los 90
+// días: pasado ese plazo desde el deploy, DEDUPE_LEGACY_LOOKUP=false y borrar
+// el bloque "LEGADO" de findExistingKeys.
+const LEGACY_LOOKUP = process.env.DEDUPE_LEGACY_LOOKUP !== 'false';
+const GETALL_CHUNK = 300;   // refs por db.getAll()
+const BATCH_LIMIT = 500;    // máx. operaciones por WriteBatch
+const ALREADY_EXISTS = 6;   // código gRPC
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// Devuelve Set<dedupeKey> con las menciones que YA existen en la campaña.
+async function findExistingKeys(db, campaignId, items) {
+  const col = db.collection('mentions');
+  const existing = new Set();
+
+  // 1) Por ID determinista: 1 lectura por candidato, sin índices ni límite de 30.
+  //    fieldMask mínimo: solo hace falta saber si el documento existe.
+  for (const lote of chunk(items, GETALL_CHUNK)) {
+    const refs = lote.map(m => col.doc(mentionDocId(campaignId, m.dedupeKey)));
+    const snaps = await db.getAll(...refs, { fieldMask: ['dedupeKey'] });
+    snaps.forEach((s, i) => { if (s.exists) existing.add(lote[i].dedupeKey); });
+  }
+
+  // 2) LEGADO (temporal): solo para lo que (1) no encontró. Sin select(): el
+  //    cálculo de dedupeKey() para docs viejos sin ese campo puede necesitar
+  //    cualquiera de sus campos.
+  if (LEGACY_LOOKUP) {
+    const rest = items.filter(m => !existing.has(m.dedupeKey));
+    const lookup = async (field, values) => {
+      const uniq = [...new Set(values.filter(Boolean))];
+      for (const lote of chunk(uniq, 30)) {
+        const snap = await col
+          .where('campaignId', '==', campaignId)
+          .where(field, 'in', lote).get();
+        snap.docs.forEach(d => existing.add(d.data().dedupeKey || dedupeKey(d.data())));
+      }
+    };
+    await lookup('dedupeKey', rest.map(m => m.dedupeKey));
+    await lookup('sourceUrl', rest.map(m => m.sourceUrl));
+  }
+
+  return existing;
+}
+
+// Inserta con create(): si el ID ya existe (otro proceso ganó la carrera) lo
+// ignora sin pisarlo. Devuelve los datos de los documentos realmente creados.
+async function createIgnoringExisting(db, entries) {
+  const created = [];
+  for (const lote of chunk(entries, BATCH_LIMIT)) {
+    const batch = db.batch();
+    lote.forEach(({ ref, data }) => batch.create(ref, data));
+    try {
+      await batch.commit();
+      created.push(...lote.map(e => e.data));
+    } catch (err) {
+      if (err.code !== ALREADY_EXISTS) throw err;
+      // Carrera: algún ID ya existía y el batch (atómico) no escribió nada.
+      // Reintento uno a uno, saltando los que ya están.
+      for (const { ref, data } of lote) {
+        try { await ref.create(data); created.push(data); }
+        catch (e) { if (e.code !== ALREADY_EXISTS) throw e; }
+      }
+    }
+  }
+  return created;
+}
+
+// Guarda un lote ya recolectado. Orden deliberado (lo caro va al final):
+//   1) dedupe dentro del lote (en memoria, gratis)
+//   2) descartar lo que ya está en Firestore (getAll por ID hash)
+//   3) enriquecer SOLO lo nuevo (sentimiento + comentarios = llamadas de red)
+//   4) escribir con create() en batches de 500
 async function persistMentions(campaignId, rawMentions, opts = {}) {
   const db = getDb();
-  const { fresh, seenCount } = await filterAlreadySaved(db, campaignId, rawMentions);
+
+  // 1) Identidad canónica compartida con orchestrator.js. Si algún ítem no
+  //    trajera dedupeKey se lo calcula: sin clave, todos colapsarían en un
+  //    mismo ID.
+  const batchIn = dedupeBatch(rawMentions)
+    .map(m => (m.dedupeKey ? m : { ...m, dedupeKey: dedupeKey(m) }));
+
+  // 2) Existencia en Firestore.
+  const existing = await findExistingKeys(db, campaignId, batchIn);
+  const fresh = batchIn.filter(m => !existing.has(m.dedupeKey));
+  const seenCount = rawMentions.length - fresh.length;
 
   if (seenCount > 0) logger.info(`Deduplicación: ${seenCount} ya existentes/repetidas descartadas`);
   if (!fresh.length) return { saved: 0, mentions: [], duplicates: seenCount };
 
+  // 3) Recién ahora se gasta IA / red: solo sobre lo que realmente es nuevo.
   await enrichNewMentions(fresh, opts);
 
-  const toSave = fresh.map(m => ({
-    ...m,
-    reach: typeof m.reach === 'number' && m.reach > 0 && m.reach < 100000 ? m.reach : 0,
-    engagement: typeof m.engagement === 'number' ? m.engagement : 0,
-    isRead: false,
-    createdAt: new Date(),
-    publishedAt: m.publishedAt || new Date(),
+  const col = db.collection('mentions');
+  const entries = fresh.map(m => ({
+    ref: col.doc(mentionDocId(campaignId, m.dedupeKey)),
+    data: {
+      ...m,
+      reach: typeof m.reach === 'number' && m.reach > 0 && m.reach < 100000 ? m.reach : 0,
+      engagement: typeof m.engagement === 'number' ? m.engagement : 0,
+      isRead: false,
+      createdAt: new Date(),
+      publishedAt: m.publishedAt || new Date(),
+    },
   }));
 
+  // 4) Escritura segura ante concurrencia.
+  let created;
   try {
-    for (let i = 0; i < toSave.length; i += 500) {
-      const batch = db.batch();
-      toSave.slice(i, i + 500).forEach(m => {
-        batch.set(db.collection('mentions').doc(generateId()), m);
-      });
-      await batch.commit();
-    }
+    created = await createIgnoringExisting(db, entries);
   } catch (err) {
     // No relanzamos: perder una escritura no puede tumbar la corrida ni el
     // histórico ya guardado.
@@ -489,10 +634,13 @@ async function persistMentions(campaignId, rawMentions, opts = {}) {
     return { saved: 0, mentions: [], duplicates: seenCount, error: err.message };
   }
 
-  // Los analytics cacheados de esta campaña ya no reflejan lo guardado.
-  if (toSave.length) invalidarCampana(campaignId);
+  const lostToRace = fresh.length - created.length;
+  if (lostToRace > 0) logger.info(`Concurrencia: ${lostToRace} mención(es) ya las había guardado otro proceso`);
 
-  return { saved: toSave.length, mentions: toSave, duplicates: seenCount };
+  // Los analytics cacheados de esta campaña ya no reflejan lo guardado.
+  if (created.length) invalidarCampana(campaignId);
+
+  return { saved: created.length, mentions: created, duplicates: seenCount + lostToRace };
 }
 
 async function scrapeAllSources(campaignId, opts = {}) {
@@ -578,6 +726,10 @@ function getZonaAliases(provincia, ciudad) {
 module.exports = {
   scrapeAllSources,
   collectFreeSources,
+  collectKeywordSources,
+  collectCampaignCustomSources,
+  getLastPublishedAt,
+  computeSince,
   loadCampaignContext,
   persistMentions,
   enrichNewMentions,
